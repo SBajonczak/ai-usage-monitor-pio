@@ -1,0 +1,8 @@
+.pio/
+.vscode/
+include/config.h
+src/vendor/*.cpp
+src/vendor/*.c
+src/vendor/*.h
+!src/vendor/README.md
+__pycache__/

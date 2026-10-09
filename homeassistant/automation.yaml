@@ -1,0 +1,33 @@
+# Home Assistant automation (add via UI YAML editor OR automations.yaml)
+# Replace the 4 sensor entity IDs with YOUR actual Claude/Codex sensors.
+# Their values must be usage percent (used), NOT remaining percent.
+# Publishing retained state allows ESP32 to reconnect without waiting 5 minutes.
+alias: AI Monitor - MQTT publish usage
+id: ai_monitor_mqtt_publish_usage
+mode: single
+triggers:
+  - trigger: time_pattern
+    minutes: "/5"
+  - trigger: homeassistant
+    event: start
+actions:
+  - action: mqtt.publish
+    data:
+      topic: ai-monitor/state
+      qos: 1
+      retain: true
+      payload: >-
+        {% set cs = states('sensor.claude_session_usage') %}
+        {% set cw = states('sensor.claude_week_usage') %}
+        {% set xs = states('sensor.codex_session_usage') %}
+        {% set xw = states('sensor.codex_week_usage') %}
+        {
+          "claude": {
+            "session_remaining": {{ (100 - cs | float) | round(0) | int if is_number(cs) else -1 }},
+            "weekly_remaining": {{ (100 - cw | float) | round(0) | int if is_number(cw) else -1 }}
+          },
+          "codex": {
+            "session_remaining": {{ (100 - xs | float) | round(0) | int if is_number(xs) else -1 }},
+            "weekly_remaining": {{ (100 - xw | float) | round(0) | int if is_number(xw) else -1 }}
+          }
+        }
