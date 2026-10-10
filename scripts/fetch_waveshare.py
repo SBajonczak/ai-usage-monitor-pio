@@ -23,6 +23,7 @@ DRIVER_FILES = (
     "board_config.h",
     "low_level_amoled.c", "low_level_amoled.h",
     "i2c.c", "i2c.h",
+    "qmi8658c.cpp", "qmi8658c.h",
 )
 
 
@@ -58,7 +59,7 @@ def ensure_drivers(target=None, opener=urllib.request.urlopen):
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise RuntimeError(
                 f"Cannot fetch {name} from {url}: {exc}. "
-                f"Copy the nine driver files from {REPO} to {dest}, "
+                f"Copy the required board driver files from {REPO} to {dest}, "
                 "or run again with Internet access."
             ) from exc
     print("[Waveshare] Board drivers present.")

@@ -7,7 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts' / 'fetch_waveshare.py'
 FILES = (
     'amoled.cpp', 'amoled.h', 'FT3168.cpp', 'FT3168.h', 'board_config.h',
-    'low_level_amoled.c', 'low_level_amoled.h', 'i2c.c', 'i2c.h'
+    'low_level_amoled.c', 'low_level_amoled.h', 'i2c.c', 'i2c.h',
+    'qmi8658c.cpp', 'qmi8658c.h'
 )
 
 

@@ -1,5 +1,5 @@
 /*
- * AI Usage Monitor - Premium UI 1.4 - PlatformIO C++ firmware
+ * AI Usage Monitor - Premium UI 1.9 (clipped rotation) - PlatformIO C++ firmware
  * Target: Waveshare ESP32-S3-Touch-AMOLED-1.43, 466x466
  * BSP implementation loaded from:
  * https://github.com/thelastoutpostworkshop/waveshare_esp32s3_1.43_amoled_lvgl9
@@ -10,53 +10,284 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <lvgl.h>
 #include "vendor/amoled.h"
 #include "vendor/FT3168.h"
+#include "vendor/qmi8658c.h"
 #include "config.h"
+#include "display_transform.h"
+#include "continuous_rotation.h"
+#include "fast_rotation.h"
+#include "clipped_rotation.h"
+#include "motion_prediction.h"
 
-// ---------- LVGL display driver (adapted to the upstream project's public API) ----------
+// Clockwise picture rotation on the physical panel. Keep as 90 for USB below.
+// Override in include/config.h with 0, 90, 180, or 270.
+#ifndef DISPLAY_ROTATION_DEG
+#define DISPLAY_ROTATION_DEG 90
+#endif
+static_assert(display_transform::valid_rotation(DISPLAY_ROTATION_DEG),
+              "DISPLAY_ROTATION_DEG must be 0, 90, 180, or 270");
+
+// ---------- LVGL display / continuous rotation ----------
 static Amoled amoled;
 static lv_display_t *disp = nullptr;
 static lv_color_t *buf1 = nullptr;
 static lv_color_t *buf2 = nullptr;
 static constexpr size_t BUF_BYTES = DISPLAY_WIDTH * 40 * sizeof(lv_color_t);
+static constexpr size_t FRAME_PIXELS = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+// PSRAM: LVGL-composited logical picture + panel-ready rotated RGB565 picture.
+static uint16_t *logicalFrame = nullptr;
+static uint16_t *panelFrame = nullptr;
+static bool pictureDirty = true;
+static bool autoRotationAvailable = false;
+static float displayAngleDeg = float(DISPLAY_ROTATION_DEG);
+static float renderedAngleDeg = -9999.0f;
+static bool renderedBilinear = false;
+// Dedicated sensor task runs independently from QSPI panel transfer.
+static SemaphoreHandle_t i2cMutex = nullptr;
+static portMUX_TYPE sensorMux = portMUX_INITIALIZER_UNLOCKED;
+static float sensorRoll = 0.0f;
+static float sensorSpeedDps = 0.0f;
+static uint32_t sensorTimeMs = 0;
+static float observedSpeedDps = 0.0f;
+static uint32_t lastMotionMs = 0;
+static uint32_t frameLastMs = 0;
+static uint32_t imuLogLastMs = 0;
+static uint32_t perfLogLastMs = 0;
+static uint32_t perfFrames = 0;
+static uint64_t perfRenderUs = 0;
+static uint64_t perfTransferUs = 0;
+
+// 1: scanline-clipped motion renderer; 0: previous v1.8 renderer
+#ifndef AUTO_ROTATION_CLIPPED_RENDER
+#define AUTO_ROTATION_CLIPPED_RENDER 1
+#endif
+#ifndef AUTO_ROTATION_ENABLED
+#define AUTO_ROTATION_ENABLED 1
+#endif
+#ifndef AUTO_ROTATION_FPS
+#define AUTO_ROTATION_FPS 30
+#endif
+#ifndef AUTO_ROTATION_ADAPTIVE_QUALITY
+#define AUTO_ROTATION_ADAPTIVE_QUALITY 1
+#endif
+#ifndef AUTO_ROTATION_ANGLE_EPSILON
+#define AUTO_ROTATION_ANGLE_EPSILON 0.20f
+#endif
+#ifndef AUTO_ROTATION_LOG_PERF
+#define AUTO_ROTATION_LOG_PERF 1
+#endif
+#ifndef AUTO_ROTATION_ACCEL_SIGN
+#define AUTO_ROTATION_ACCEL_SIGN 1
+#endif
+#ifndef AUTO_ROTATION_GYRO_SIGN
+#define AUTO_ROTATION_GYRO_SIGN -1
+#endif
+#ifndef AUTO_ROTATION_BILINEAR
+#define AUTO_ROTATION_BILINEAR 1
+#endif
+#ifndef AUTO_ROTATION_ACCEL_GAIN
+#define AUTO_ROTATION_ACCEL_GAIN 0.035f
+#endif
+#ifndef AUTO_ROTATION_MAX_ACCEL_ERROR
+#define AUTO_ROTATION_MAX_ACCEL_ERROR 2.5f
+#endif
+static_assert(AUTO_ROTATION_FPS >= 1 && AUTO_ROTATION_FPS <= 60,
+              "AUTO_ROTATION_FPS must be 1..60");
+static_assert(AUTO_ROTATION_ACCEL_SIGN == 1 || AUTO_ROTATION_ACCEL_SIGN == -1,
+              "AUTO_ROTATION_ACCEL_SIGN must be +1 or -1");
+static_assert(AUTO_ROTATION_GYRO_SIGN == 1 || AUTO_ROTATION_GYRO_SIGN == -1,
+              "AUTO_ROTATION_GYRO_SIGN must be +1 or -1");
+
+#ifndef AUTO_ROTATION_SENSOR_HZ
+#define AUTO_ROTATION_SENSOR_HZ 100
+#endif
+#ifndef AUTO_ROTATION_PREDICT_MS
+#define AUTO_ROTATION_PREDICT_MS 15
+#endif
+#ifndef AUTO_ROTATION_STILL_MS
+#define AUTO_ROTATION_STILL_MS 120
+#endif
+#ifndef AUTO_ROTATION_MOVEMENT_DPS
+#define AUTO_ROTATION_MOVEMENT_DPS 4.0f
+#endif
+static_assert(AUTO_ROTATION_SENSOR_HZ >= 20 && AUTO_ROTATION_SENSOR_HZ <= 200,
+              "AUTO_ROTATION_SENSOR_HZ must be between 20 and 200");
+static_assert(AUTO_ROTATION_PREDICT_MS >= 0 && AUTO_ROTATION_PREDICT_MS <= 50,
+              "AUTO_ROTATION_PREDICT_MS must be between 0 and 50");
 
 static uint32_t tick_cb() { return millis(); }
+
 static void flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *pixels) {
-  // IMPORTANT: LVGL RGB565 pixels are little-endian in RAM, but the
-  // SH8601/CO5300 QSPI panel expects MSB-first RGB565 bytes. The Waveshare
-  // Amoled::drawArea() copies the buffer unchanged. Without swapping here,
-  // dark blue turns pink and cyan becomes green/magenta (visible in v1.3).
-  // The partial LVGL draw buffer is disposable until its next render.
-  uint16_t *px = reinterpret_cast<uint16_t *>(pixels);
-  const size_t count = static_cast<size_t>(lv_area_get_width(area)) * lv_area_get_height(area);
-  for (size_t i = 0; i < count; ++i) {
-    const uint16_t color = px[i];
-    px[i] = static_cast<uint16_t>((color << 8) | (color >> 8));
+  // LVGL partial RGB565 tiles are combined into one logical frame in PSRAM.
+  // The panel is updated later from a full rotated snapshot. Do NOT swap bytes here.
+  const uint16_t *src = reinterpret_cast<const uint16_t *>(pixels);
+  const int w = lv_area_get_width(area), h = lv_area_get_height(area);
+  for (int row = 0; row < h; ++row) {
+    memcpy(logicalFrame + (area->y1 + row) * DISPLAY_WIDTH + area->x1,
+           src + row * w, w * sizeof(uint16_t));
   }
-  amoled.drawArea(area->x1, area->y1, area->x2, area->y2, px);
+  pictureDirty = true;
   lv_display_flush_ready(display);
 }
-// Required for the 1.43" CO5300 panel's even-pixel transfer alignment.
+
+// Panel controller needs x/y even-aligned rectangles.
 static void rounder_cb(lv_event_t *event) {
   if (lv_event_get_code(event) != LV_EVENT_INVALIDATE_AREA) return;
-  lv_area_t *a = static_cast<lv_area_t *>(lv_event_get_param(event));
+  auto *a = static_cast<lv_area_t *>(lv_event_get_param(event));
   if (!a) return;
-  a->x1 &= ~1;
-  a->x2 |= 1;
-  a->y1 &= ~1;
-  a->y2 |= 1;
+  a->x1 &= ~1; a->x2 |= 1;
+  a->y1 &= ~1; a->y2 |= 1;
 }
-static void touch_cb(lv_indev_t *indev, lv_indev_data_t *data) {
+
+static void touch_cb(lv_indev_t *, lv_indev_data_t *data) {
   uint16_t x = 0, y = 0;
-  if (getTouch(&x, &y)) {
-    data->point.x = x;
-    data->point.y = y;
-    data->state = LV_INDEV_STATE_PRESSED;
-  } else {
-    data->state = LV_INDEV_STATE_RELEASED;
+  // Touch and QMI8658 share I2C pins; never read concurrently.
+  // If the IMU holds the bus, keep last touch state instead of
+  // generating an accidental release/click.
+  if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(4)) != pdTRUE) {
+    return;
   }
+  const bool pressed = getTouch(&x, &y);
+  if (i2cMutex) xSemaphoreGive(i2cMutex);
+  if (!pressed) {
+    data->state = LV_INDEV_STATE_RELEASED;
+    return;
+  }
+  const auto pt = continuous_rotation::touch_to_logical(
+      x, y, DISPLAY_WIDTH, DISPLAY_HEIGHT, displayAngleDeg);
+  data->point.x = pt.x;
+  data->point.y = pt.y;
+  data->state = LV_INDEV_STATE_PRESSED;
+}
+
+// Read IMU continuously on the other ESP32-S3 core so SPI transfers
+// cannot stall motion samples. Only very small state snapshots use spinlock.
+static void motionTask(void *) {
+  continuous_rotation::ComplementaryRoll filter;
+  TickType_t lastWake = xTaskGetTickCount();
+  uint32_t lastSample = 0;
+  while (true) {
+    float acc[3] = {}, gyro[3] = {};
+    const uint32_t now = millis();
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(8)) == pdTRUE) {
+      qmi8658_read_xyz(acc, gyro);
+      xSemaphoreGive(i2cMutex);
+      const float dt = lastSample ? fminf((now - lastSample) * .001f, .10f) : .01f;
+      lastSample = now;
+      if (isfinite(acc[0]) && isfinite(acc[1]) && isfinite(acc[2]) &&
+          isfinite(gyro[2])) {
+        const float signedGz = gyro[2] * AUTO_ROTATION_GYRO_SIGN;
+        filter.update(acc[0] * AUTO_ROTATION_ACCEL_SIGN, acc[1], acc[2],
+                      signedGz, dt, AUTO_ROTATION_ACCEL_GAIN,
+                      AUTO_ROTATION_MAX_ACCEL_ERROR);
+        portENTER_CRITICAL(&sensorMux);
+        sensorRoll = filter.angleDegrees();
+        sensorSpeedDps = signedGz * continuous_rotation::kRadToDeg;
+        sensorTimeMs = now;
+        portEXIT_CRITICAL(&sensorMux);
+      }
+    }
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1000 / AUTO_ROTATION_SENSOR_HZ));
+  }
+}
+
+static void sampleMotion() {
+  if (!autoRotationAvailable) return;
+  float roll = 0.0f, speed = 0.0f;
+  uint32_t timeMs = 0;
+  portENTER_CRITICAL(&sensorMux);
+  roll = sensorRoll;
+  speed = sensorSpeedDps;
+  timeMs = sensorTimeMs;
+  portEXIT_CRITICAL(&sensorMux);
+  const uint32_t now = millis();
+  if (timeMs == 0 || now - timeMs > 300) return;
+  observedSpeedDps = speed;
+  // Predict the short transfer latency only, never extrapolate stale readings.
+  // Excessive prediction makes the UI swing past the user's hand.
+  const uint32_t sampleAgeMs = now - timeMs;
+  displayAngleDeg = motion_prediction::predict(
+      DISPLAY_ROTATION_DEG, roll, speed,
+      sampleAgeMs, AUTO_ROTATION_PREDICT_MS);
+  if (now - imuLogLastMs > 5000) {
+    imuLogLastMs = now;
+    Serial.printf("[IMU] roll %.1f deg | speed %.1f deg/s | age %lu ms\n",
+                  roll, speed, (unsigned long)sampleAgeMs);
+  }
+}
+
+static void updatePhysicalPanel() {
+  const uint32_t now = millis();
+  if (now - frameLastMs < (1000U / AUTO_ROTATION_FPS)) return;
+  const float angleDelta = fabsf(continuous_rotation::shortest_difference(
+      displayAngleDeg, renderedAngleDeg));
+  const bool changedAngle = angleDelta > AUTO_ROTATION_ANGLE_EPSILON;
+  // During motion, nearest-neighbor is much cheaper than four PSRAM reads
+  // plus bilinear blending per pixel. When motion stops, automatically draw
+  // one final antialiased frame. All sampling remains at native 466x466.
+  // Quality hysteresis: don't swap nearest/bilinear on alternating
+  // frames (visible as edge shimmer). Remain fast during motion; polish
+  // once after the device has settled for AUTO_ROTATION_STILL_MS.
+  const bool moving = fabsf(observedSpeedDps) > AUTO_ROTATION_MOVEMENT_DPS ||
+                      angleDelta > 0.45f;
+  if (moving) lastMotionMs = now;
+  const bool interpolate = (AUTO_ROTATION_BILINEAR != 0) &&
+      !(AUTO_ROTATION_ADAPTIVE_QUALITY &&
+        (uint32_t)(now - lastMotionMs) < AUTO_ROTATION_STILL_MS);
+  const bool qualityChanged = renderedBilinear != interpolate;
+  if (!pictureDirty && !changedAngle && !qualityChanged) return;
+  frameLastMs = now;
+  // Snapshot angle before drawing; IMU polling during transfer must not
+  // change which angle we claim has already been displayed.
+  const float frameAngleDeg = displayAngleDeg;
+  // full screen rotation, including LVGL labels and ring backdrop
+  const uint32_t rotateStartUs = micros();
+#if AUTO_ROTATION_CLIPPED_RENDER
+  clipped_rotation::render_rgb565(
+      logicalFrame, panelFrame, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+      frameAngleDeg, interpolate);
+#else
+  fast_rotation::rotate_rgb565(
+      logicalFrame, panelFrame, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+      frameAngleDeg, interpolate);
+#endif
+  const uint32_t rotateDurationUs = micros() - rotateStartUs;
+  const uint32_t transferStartUs = micros();
+  // Send in even row strips: avoids a single huge DMA transfer and
+  // works with Waveshare's QSPI partial-area transfer API.
+  constexpr int BLOCK_ROWS = 16;
+  for (int y = 0; y < DISPLAY_HEIGHT; y += BLOCK_ROWS) {
+    const int y2 = (y + BLOCK_ROWS <= DISPLAY_HEIGHT)
+      ? y + BLOCK_ROWS - 1 : DISPLAY_HEIGHT - 1;
+    amoled.drawArea(0, y, DISPLAY_WIDTH - 1, y2,
+                    panelFrame + y * DISPLAY_WIDTH);
+  }
+  const uint32_t transferDurationUs = micros() - transferStartUs;
+  ++perfFrames;
+  perfRenderUs += rotateDurationUs;
+  perfTransferUs += transferDurationUs;
+#if AUTO_ROTATION_LOG_PERF
+  if (now - perfLogLastMs > 5000) {
+    const uint32_t elapsed = now - perfLogLastMs;
+    Serial.printf("[PERF] %.1f fps | rotate %.1f ms | panel %.1f ms | heap %u | psram %u\n",
+                  perfFrames * 1000.f / elapsed,
+                  perfRenderUs / (perfFrames * 1000.f),
+                  perfTransferUs / (perfFrames * 1000.f),
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    perfLogLastMs = now;
+    perfFrames = 0;
+    perfRenderUs = 0;
+    perfTransferUs = 0;
+  }
+#endif
+  renderedAngleDeg = frameAngleDeg;
+  renderedBilinear = interpolate;
+  pictureDirty = false;
 }
 
 // ---------- Usage state ----------
@@ -412,6 +643,37 @@ void setup() {
     Serial.println("PSRAM allocation failed. Enable OPI PSRAM in board settings.");
     while (true) delay(1000);
   }
+  logicalFrame = (uint16_t *)heap_caps_calloc(
+      FRAME_PIXELS, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  panelFrame = (uint16_t *)heap_caps_malloc(
+      FRAME_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!logicalFrame || !panelFrame) {
+    Serial.println("PSRAM allocation failed for complete rotation framebuffers.");
+    while (true) delay(1000);
+  }
+  Serial.printf("[DISPLAY] Base rotation: %d degrees clockwise\n", DISPLAY_ROTATION_DEG);
+  Serial.printf("[PERF] clipped motion renderer: %s | CPU %u MHz\n",
+                AUTO_ROTATION_CLIPPED_RENDER ? "ON" : "OFF",getCpuFrequencyMhz());
+#if AUTO_ROTATION_ENABLED
+  Serial.println("[IMU] Initializing QMI8658 for smooth screen rotation...");
+  const uint8_t whoami = qmi8658_init();
+  if (whoami) {
+    i2cMutex = xSemaphoreCreateMutex();
+    if (!i2cMutex) {
+      Serial.println("[IMU] Cannot create I2C mutex; fixed orientation fallback");
+    } else {
+      autoRotationAvailable = xTaskCreatePinnedToCore(
+          motionTask, "motion", 4096, nullptr, 2, nullptr, 0) == pdPASS;
+      Serial.printf("[IMU] QMI8658 %u; background task %s at %d Hz\n",
+                    whoami, autoRotationAvailable ? "ready" : "FAILED",
+                    AUTO_ROTATION_SENSOR_HZ);
+    }
+  } else {
+    Serial.println("[IMU] Sensor not found: falling back to fixed rotation");
+  }
+#else
+  Serial.println("[IMU] Auto-rotation disabled; fixed angle only");
+#endif
   ringPixels = (uint16_t *)heap_caps_malloc(
     DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!ringPixels) {
@@ -441,10 +703,12 @@ void setup() {
 }
 void loop() {
   maintainNetwork();
+  sampleMotion();
   lv_timer_handler();
+  updatePhysicalPanel();
   if (millis() - lastUiRefresh > 3000) {
     lastUiRefresh = millis();
     updateUi();
   }
-  delay(5);
+  delay(1);
 }
