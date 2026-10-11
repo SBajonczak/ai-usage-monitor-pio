@@ -4,6 +4,9 @@ ESP32-S3 Waveshare **1.43\" / 466 × 466** — PlatformIO / LVGL 9 / WLAN / MQTT
 
 This is the v1.9 **clipped rotation** firmware with two small mascot animations and more informative gauges. It has **not yet been flash-tested on real hardware**.
 
+<img width="200" alt="Jadebyte" src="https://github.com/user-attachments/assets/37d92b48-a90e-4fdd-bf8e-8696fa412d24" />
+<img width="200" alt="Claude" src="https://github.com/user-attachments/assets/6bc2c902-ff11-4249-8d66-c087a3beb1e7" />
+
 ## Getting started
 
 1. Copy `include/config.example.h` to `include/config.h` and enter your Wi-Fi / MQTT settings. **Do not replace your working `config.h` without saving it.**
