@@ -1,5 +1,5 @@
 /*
- * AI Usage Monitor - Premium UI 1.9 (clipped rotation) - PlatformIO C++ firmware
+ * AI Usage Monitor - Premium UI 2.0 (mascot animations + cached gauges) - PlatformIO C++ firmware
  * Target: Waveshare ESP32-S3-Touch-AMOLED-1.43, 466x466
  * BSP implementation loaded from:
  * https://github.com/thelastoutpostworkshop/waveshare_esp32s3_1.43_amoled_lvgl9
@@ -23,6 +23,7 @@
 #include "fast_rotation.h"
 #include "clipped_rotation.h"
 #include "motion_prediction.h"
+#include "mascot_frames.h"
 
 // Clockwise picture rotation on the physical panel. Keep as 90 for USB below.
 // Override in include/config.h with 0, 90, 180, or 270.
@@ -296,6 +297,8 @@ struct Usage {
   int weekly = -1;
   bool live = false;
   uint32_t receivedMs = 0;
+  char reset5h[24] = "--";
+  char resetWeek[24] = "--";
 };
 static Usage claude = {72, 57, false, 0}; // explicitly DEMO until MQTT arrives
 static Usage codex  = {46, 35, false, 0};
@@ -303,8 +306,28 @@ static bool showCodex = true; // Start with the Codex look from the reference ph
 // High-quality ring background, drawn at full native 466x466 resolution.
 // Each ring edge is covered by a smooth, fractional-pixel alpha gradient.
 static lv_obj_t *ringCanvas = nullptr;
-static uint16_t *ringPixels = nullptr; // ~424 KiB in PSRAM
+struct RingCache {
+  uint16_t *pixels = nullptr;
+  int session = -101;
+  int weekly = -101;
+};
+static RingCache ringCaches[2];  // one per provider: no slow re-render on page change
 static int drawnProvider = -1, drawnSession = -2, drawnWeek = -2;
+static lv_obj_t *mascotCanvas = nullptr;
+static uint8_t *mascotPixels = nullptr;  // 120x120 ARGB8888 in PSRAM
+static int mascotProvider = -1;
+static int mascotFrame = -1;
+static uint32_t mascotLastMs = 0;
+#ifndef MASCOT_ENABLED
+#define MASCOT_ENABLED 1
+#endif
+#ifndef MASCOT_IDLE_FPS
+#define MASCOT_IDLE_FPS 4
+#endif
+#ifndef MASCOT_PAUSE_WHILE_TURNING
+#define MASCOT_PAUSE_WHILE_TURNING 1
+#endif
+static_assert(MASCOT_IDLE_FPS >= 1 && MASCOT_IDLE_FPS <= 8, "MASCOT_IDLE_FPS must be 1..8");
 static lv_obj_t *titleLabel = nullptr;
 static lv_obj_t *numberLabel = nullptr;
 static lv_obj_t *weekValueLabel = nullptr;
@@ -312,6 +335,7 @@ static lv_obj_t *weekCard = nullptr;
 static lv_obj_t *sourceLabel = nullptr;
 static lv_obj_t *networkLabel = nullptr;
 static lv_obj_t *mqttLabel = nullptr;
+static lv_obj_t *resetLabel = nullptr;
 static lv_obj_t *statusDot = nullptr;
 static constexpr uint32_t STALE_MS = 20UL * 60UL * 1000UL;
 
@@ -419,7 +443,10 @@ static void paintRing(Rgb &pixel, float dx, float dy, float radius,
 }
 
 static void drawSmoothRings(int provider, int session, int weekly) {
-  if (!ringPixels || !ringCanvas) return;
+  if (provider < 0 || provider > 1 || !ringCaches[provider].pixels) return;
+  RingCache &cache = ringCaches[provider];
+  if (cache.session == session && cache.weekly == weekly) return;
+  uint16_t *const dst = cache.pixels;
   const bool codexTheme = provider == 1;
   const Rgb background = {7, 11, 19};
   const Rgb track = {49, 66, 87};
@@ -444,10 +471,11 @@ static void drawSmoothRings(int provider, int session, int weekly) {
                 track, weeklyColor, 5.0f);
       paintRing(rgb, dx, dy, INNER_R, INNER_W, session,
                 track, sessionColor, 224.0f);
-      ringPixels[y * DISPLAY_WIDTH + x] = pack565(rgb);
+      dst[y * DISPLAY_WIDTH + x] = pack565(rgb);
     }
   }
-  lv_obj_invalidate(ringCanvas);
+  cache.session = session;
+  cache.weekly = weekly;
 }
 
 static lv_obj_t *makeLabel(lv_obj_t *parent, const char *label,
@@ -462,36 +490,82 @@ static lv_obj_t *makeLabel(lv_obj_t *parent, const char *label,
   return obj;
 }
 
+static void updateText(lv_obj_t *obj, const char *value) {
+  if (obj && strcmp(lv_label_get_text(obj), value) != 0) lv_label_set_text(obj, value);
+}
+
+static void updateMascot(bool force = false) {
+#if MASCOT_ENABLED
+  if (!mascotCanvas || !mascotPixels) return;
+  const uint32_t now = millis();
+  if (!force && now - mascotLastMs < 1000U / MASCOT_IDLE_FPS) return;
+#if MASCOT_PAUSE_WHILE_TURNING
+  // A moving UI already spends ~65ms per screen in the full RGB565 renderer.
+  // Pausing the sprite prevents an extra source-frame redraw from adding stutter.
+  if (!force && (fabsf(observedSpeedDps) > AUTO_ROTATION_MOVEMENT_DPS ||
+                 (uint32_t)(now-lastMotionMs) < 350U)) return;
+#endif
+  const int provider = showCodex ? 1 : 0;
+  // Gentle vertical float; blink only briefly every ~4 seconds.
+  const uint32_t phase = (now / 250U) % 16U;
+  const int frame = (phase == 9U) ? 2 : ((phase % 4U) >= 2 ? 1 : 0);
+  if (!force && mascotProvider == provider && mascotFrame == frame) return;
+  const uint32_t *const *frames = provider ? mascot_frames::jadebyte : mascot_frames::claude;
+  memcpy(mascotPixels, frames[frame], mascot_frames::SIDE * mascot_frames::SIDE * 4U);
+  lv_obj_invalidate(mascotCanvas);
+  lv_obj_align(mascotCanvas, LV_ALIGN_CENTER, 0, -53 + (frame == 1 ? -2 : 0));
+  lv_obj_invalidate(mascotCanvas);
+  mascotProvider = provider;
+  mascotFrame = frame;
+  mascotLastMs = now;
+#else
+  (void)force;
+#endif
+}
+
 static void updateUi() {
   const Usage &u = showCodex ? codex : claude;
   const int provider = showCodex ? 1 : 0;
   const lv_color_t accent = lv_color_hex(showCodex ? 0x26DCEE : 0xF6A96F);
   const bool stale = isStale(u);
-  lv_label_set_text(titleLabel, showCodex ? "CODEX" : "CLAUDE");
-  lv_obj_set_style_text_color(titleLabel, lv_color_hex(0xF4F7FF), 0);
+  updateText(titleLabel, showCodex ? "CODEX" : "CLAUDE");
   const int s = validPercent(u.session) ? u.session : -1;
   const int w = validPercent(u.weekly) ? u.weekly : -1;
+  // Inactive provider's gauges are kept in PSRAM; switching pages is instant.
   if (provider != drawnProvider || s != drawnSession || w != drawnWeek) {
     drawSmoothRings(provider, s, w);
+    if (ringCanvas) {
+      lv_canvas_set_buffer(ringCanvas, ringCaches[provider].pixels,
+          DISPLAY_WIDTH, DISPLAY_HEIGHT, LV_COLOR_FORMAT_RGB565);
+      lv_obj_invalidate(ringCanvas);
+    }
     drawnProvider = provider;
     drawnSession = s;
     drawnWeek = w;
   }
-  if (s >= 0) lv_label_set_text_fmt(numberLabel, "%d%%", s);
-  else lv_label_set_text(numberLabel, "--");
-  if (w >= 0) lv_label_set_text_fmt(weekValueLabel, "%d%% FREI", w);
-  else lv_label_set_text(weekValueLabel, "--");
-  lv_obj_set_style_text_color(weekValueLabel, accent, 0);
+  char text[96];
+  snprintf(text,sizeof(text), s >= 0 ? "5H  %d%% FREI" : "5H  --", s);
+  updateText(numberLabel,text);
+  snprintf(text,sizeof(text), w >= 0 ? "%d%% FREI" : "--", w);
+  updateText(weekValueLabel,text);
+  static int lastAccentProvider = -1;
+  if (provider != lastAccentProvider) {
+    lv_obj_set_style_text_color(weekValueLabel, accent, 0);
+    lastAccentProvider = provider;
+  }
+  snprintf(text,sizeof(text),"RESET 5H %s  |  W %s",u.reset5h,u.resetWeek);
+  updateText(resetLabel,text);
 
-  if (!u.live) lv_label_set_text(sourceLabel, "DEMO  /  TIPPEN ZUM WECHSELN");
-  else if (stale) lv_label_set_text(sourceLabel, "VERALTET  /  TIPPEN ZUM WECHSELN");
-  else lv_label_set_text(sourceLabel, "TIPPEN ZUM WECHSELN");
+  if (!u.live) updateText(sourceLabel,"DEMO  /  TIPPEN ZUM WECHSELN");
+  else if (stale) updateText(sourceLabel,"VERALTET  /  TIPPEN ZUM WECHSELN");
+  else updateText(sourceLabel,"TIPPEN ZUM WECHSELN");
 
   const bool wifiOk = WiFi.status() == WL_CONNECTED;
   const bool mqttOk = mqtt.connected();
-  lv_label_set_text(networkLabel, wifiOk ? "ONLINE" : "OFFLINE");
-  lv_label_set_text(mqttLabel, mqttOk ? "MQTT OK" : "MQTT --");
+  updateText(networkLabel, wifiOk ? "ONLINE" : "OFFLINE");
+  updateText(mqttLabel, mqttOk ? "MQTT OK" : "MQTT --");
   lv_obj_set_style_bg_color(statusDot, lv_color_hex(mqttOk ? 0x3FDE8B : 0xE38F60), 0);
+  updateMascot(mascotProvider != provider);
 }
 
 static void onScreenEvent(lv_event_t *event) {
@@ -507,22 +581,29 @@ static void createUi() {
   lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
   ringCanvas = lv_canvas_create(root);
-  lv_canvas_set_buffer(ringCanvas, ringPixels, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                       LV_COLOR_FORMAT_RGB565);
+  lv_canvas_set_buffer(ringCanvas, ringCaches[1].pixels, DISPLAY_WIDTH,
+                       DISPLAY_HEIGHT, LV_COLOR_FORMAT_RGB565);
   lv_obj_center(ringCanvas);
   lv_obj_remove_flag(ringCanvas, LV_OBJ_FLAG_CLICKABLE);
 
-  titleLabel = makeLabel(root, "CLAUDE", 0, -104, lv_color_hex(0xF4F7FF), &lv_font_montserrat_24);
-  lv_obj_set_style_text_letter_space(titleLabel, 4, 0);
-  numberLabel = makeLabel(root, "72%", 0, -43, lv_color_hex(0xFCFDFF), &lv_font_montserrat_48);
-  // Narrow subtitle provides more breathing room around the central value.
-  lv_obj_t *subtitle = makeLabel(root, "5-STUNDEN-LIMIT", 0, 12,
-                                 lv_color_hex(0x98A7BE), &lv_font_montserrat_18);
-  lv_obj_set_style_text_letter_space(subtitle, 2, 0);
+  titleLabel = makeLabel(root, "CODEX", 0, -142,
+       lv_color_hex(0xF4F7FF), &lv_font_montserrat_24);
+  lv_obj_set_style_text_letter_space(titleLabel, 3, 0);
 
+#if MASCOT_ENABLED
+  mascotCanvas = lv_canvas_create(root);
+  lv_canvas_set_buffer(mascotCanvas, mascotPixels, mascot_frames::SIDE,
+                        mascot_frames::SIDE, LV_COLOR_FORMAT_ARGB8888);
+  lv_obj_align(mascotCanvas, LV_ALIGN_CENTER, 0, -53);
+  lv_obj_remove_flag(mascotCanvas, LV_OBJ_FLAG_CLICKABLE);
+#endif
+
+  // Both percentages remain directly legible; mascot NEVER covers a gauge value.
+  numberLabel = makeLabel(root, "5H  46% FREI", 0, 20,
+                          lv_color_hex(0xFFFFFF), &lv_font_montserrat_28);
   weekCard = lv_obj_create(root);
-  lv_obj_set_size(weekCard, 286, 50);
-  lv_obj_align(weekCard, LV_ALIGN_CENTER, 0, 76);
+  lv_obj_set_size(weekCard, 262, 45);
+  lv_obj_align(weekCard, LV_ALIGN_CENTER, 0, 67);
   lv_obj_set_style_radius(weekCard, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(weekCard, lv_color_hex(0x151E2D), 0);
   lv_obj_set_style_bg_opa(weekCard, LV_OPA_COVER, 0);
@@ -531,20 +612,16 @@ static void createUi() {
   lv_obj_set_style_pad_all(weekCard, 0, 0);
   lv_obj_remove_flag(weekCard, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_remove_flag(weekCard, LV_OBJ_FLAG_CLICKABLE);
-  makeLabel(weekCard, "WOCHE", -77, 0, lv_color_hex(0xBAC7D8), &lv_font_montserrat_18);
-  lv_obj_t *separator = lv_obj_create(weekCard);
-  lv_obj_set_size(separator, 1, 24);
-  lv_obj_set_style_bg_color(separator, lv_color_hex(0x4B5B74), 0);
-  lv_obj_set_style_bg_opa(separator, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(separator, 0, 0);
-  lv_obj_align(separator, LV_ALIGN_CENTER, -14, 0);
-  weekValueLabel = makeLabel(weekCard, "57% FREI", 64, 0,
+  makeLabel(weekCard, "WOCHE", -69, 0,
+            lv_color_hex(0xBAC7D8), &lv_font_montserrat_16);
+  weekValueLabel = makeLabel(weekCard, "35% FREI", 66, 0,
                              lv_color_hex(0x26DCEE), &lv_font_montserrat_18);
 
-  sourceLabel = makeLabel(root, "DEMO  /  TIPPEN ZUM WECHSELN", 0, 138,
-                          lv_color_hex(0xA3B3CA), &lv_font_montserrat_14);
-  lv_obj_set_style_text_letter_space(sourceLabel, 1, 0);
-  networkLabel = makeLabel(root, "OFFLINE", -64, 168,
+  resetLabel = makeLabel(root, "RESET 5H -- | W --", 0, 112,
+                         lv_color_hex(0xB6C7DB), &lv_font_montserrat_14);
+  sourceLabel = makeLabel(root, "DEMO  /  TIPPEN ZUM WECHSELN", 0, 135,
+                          lv_color_hex(0x839AB2), &lv_font_montserrat_14);
+  networkLabel = makeLabel(root, "OFFLINE", -38, 158,
                            lv_color_hex(0x899AAF), &lv_font_montserrat_14);
   statusDot = lv_obj_create(root);
   lv_obj_set_size(statusDot, 7, 7);
@@ -553,11 +630,10 @@ static void createUi() {
   lv_obj_set_style_bg_opa(statusDot, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(statusDot, 0, 0);
   lv_obj_set_style_pad_all(statusDot, 0, 0);
-  lv_obj_align(statusDot, LV_ALIGN_CENTER, 0, 168);
-  mqttLabel = makeLabel(root, "MQTT --", 69, 168,
+  lv_obj_align(statusDot, LV_ALIGN_CENTER, 0, 158);
+  mqttLabel = makeLabel(root, "MQTT --", 42, 158,
                         lv_color_hex(0x899AAF), &lv_font_montserrat_14);
 
-  // Full-screen transparent touch zone. Exactly one tap changes provider.
   lv_obj_t *tapLayer = lv_obj_create(root);
   lv_obj_set_size(tapLayer, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   lv_obj_center(tapLayer);
@@ -585,6 +661,10 @@ static void applyUsage(JsonVariantConst source, Usage &target) {
   target.weekly = validPercent(w) ? w : -1;
   target.live = true;
   target.receivedMs = millis();
+  const char *r5 = source["session_reset"].as<const char *>();
+  const char *rw = source["weekly_reset"].as<const char *>();
+  if (r5) { strncpy(target.reset5h,r5,sizeof(target.reset5h)-1); target.reset5h[sizeof(target.reset5h)-1]='\0'; }
+  if (rw) { strncpy(target.resetWeek,rw,sizeof(target.resetWeek)-1); target.resetWeek[sizeof(target.resetWeek)-1]='\0'; }
 }
 static void mqttCallback(char *topic, byte *payload, unsigned int size) {
   if (strcmp(topic, MQTT_TOPIC) != 0) return;
@@ -674,12 +754,29 @@ void setup() {
 #else
   Serial.println("[IMU] Auto-rotation disabled; fixed angle only");
 #endif
-  ringPixels = (uint16_t *)heap_caps_malloc(
-    DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!ringPixels) {
-    Serial.println("PSRAM allocation failed for smooth full-resolution canvas.");
+  for (int i=0;i<2;i++) {
+    ringCaches[i].pixels = (uint16_t *)heap_caps_malloc(
+      DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ringCaches[i].pixels) {
+      Serial.println("PSRAM allocation failed for cached gauge canvas.");
+      while (true) delay(1000);
+    }
+  }
+  // Generate both ring backgrounds at startup. Page switch no longer pauses
+  // to calculate all pixels/trigonometric coverage from scratch.
+  drawSmoothRings(0,claude.session,claude.weekly);
+  drawSmoothRings(1,codex.session,codex.weekly);
+#if MASCOT_ENABLED
+  mascotPixels = (uint8_t*)heap_caps_malloc(
+      mascot_frames::SIDE * mascot_frames::SIDE * 4U,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!mascotPixels) {
+    Serial.println("PSRAM allocation failed for mascot frame.");
     while (true) delay(1000);
   }
+  memset(mascotPixels,0,mascot_frames::SIDE*mascot_frames::SIDE*4U);
+#endif
   disp = lv_display_create(DISPLAY_WIDTH, DISPLAY_HEIGHT);
   lv_display_set_flush_cb(disp, flush_cb);
   lv_display_set_buffers(disp, buf1, buf2, BUF_BYTES, LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -704,6 +801,7 @@ void setup() {
 void loop() {
   maintainNetwork();
   sampleMotion();
+  updateMascot();
   lv_timer_handler();
   updatePhysicalPanel();
   if (millis() - lastUiRefresh > 3000) {

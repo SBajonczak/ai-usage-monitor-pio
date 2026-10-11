@@ -18,13 +18,16 @@ class PremiumUiTests(unittest.TestCase):
         self.assertIn("Rgb{27, 221, 237}", CODE) # teal
         self.assertIn("Rgb{217, 64, 232}", CODE) # magenta
         self.assertIn("lv_obj_set_style_radius(weekCard, LV_RADIUS_CIRCLE", CODE)
-        self.assertIn('"5-STUNDEN-LIMIT"', CODE)
+        self.assertIn('"5H  46% FREI"', CODE)
+        self.assertIn('"WOCHE"', CODE)
+        self.assertIn("resetLabel", CODE)
         self.assertIn('"TIPPEN ZUM WECHSELN"', CODE)
         self.assertIn('"ONLINE"', CODE)
         self.assertIn('"MQTT OK"', CODE)
 
     def test_actual_display_and_touch_kept(self):
-        self.assertIn("lv_canvas_set_buffer(ringCanvas, ringPixels, DISPLAY_WIDTH, DISPLAY_HEIGHT,", CODE)
+        self.assertIn("lv_canvas_set_buffer(ringCanvas, ringCaches[1].pixels, DISPLAY_WIDTH,", CODE)
+        self.assertIn("lv_canvas_set_buffer(mascotCanvas, mascotPixels,", CODE)
         self.assertIn("Touch_Init();", CODE)
         self.assertIn("mqtt.subscribe(MQTT_TOPIC, 1)", CODE)
         self.assertIn("lv_obj_add_event_cb(tapLayer, onScreenEvent, LV_EVENT_CLICKED", CODE)

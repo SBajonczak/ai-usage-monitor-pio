@@ -1,0 +1,20 @@
+# Home Assistant > Developer Tools > Actions > mqtt.publish
+# Example only. No credits are inferred from ChatGPT or Claude subscriptions.
+topic: ai-monitor/state
+qos: 1
+retain: true
+payload: >-
+  {
+    "claude": {
+      "session_remaining": 72,
+      "weekly_remaining": 57,
+      "session_reset": "21:30",
+      "weekly_reset": "Mo 11:00"
+    },
+    "codex": {
+      "session_remaining": 46,
+      "weekly_remaining": 35,
+      "session_reset": "20:00",
+      "weekly_reset": "Di 09:00"
+    }
+  }

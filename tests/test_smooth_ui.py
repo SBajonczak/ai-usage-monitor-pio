@@ -7,7 +7,7 @@ class SmoothUiTests(unittest.TestCase):
     def test_no_legacy_lvgl_arcs(self):
         main = (ROOT / 'src/main.cpp').read_text()
         self.assertNotIn('lv_arc_create(', main)
-        self.assertIn('lv_canvas_set_buffer(ringCanvas, ringPixels, DISPLAY_WIDTH, DISPLAY_HEIGHT,', main)
+        self.assertIn('lv_canvas_set_buffer(ringCanvas, ringCaches[1].pixels, DISPLAY_WIDTH,', main)
         self.assertIn('LV_COLOR_FORMAT_RGB565', main)
 
     def test_psram_canvas(self):

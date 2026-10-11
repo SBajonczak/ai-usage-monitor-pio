@@ -6,4 +6,3 @@ src/vendor/*.c
 src/vendor/*.h
 !src/vendor/README.md
 __pycache__/
-config.h
